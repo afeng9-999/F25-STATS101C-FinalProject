@@ -1,0 +1,145 @@
+library(data.table)
+library(readr)
+library(Matrix)
+library(xgboost)
+library(pROC)
+library(caret)
+
+set.seed(42)
+
+# ---------- 1) Load data ----------------------------------------------------
+train <- read_csv("aluminum_coldRoll_train.csv", show_col_types = FALSE)
+test  <- read_csv("aluminum_coldRoll_testNoY.csv", show_col_types = FALSE)
+
+# detect ID column in test
+id_col <- intersect(c("ID","Id","id"), names(test))
+if (length(id_col) == 0) stop("No ID column found in test file.")
+id_col <- id_col[1]
+test_ids <- test[[id_col]]
+
+# ---------- 2) Quick signal scan: best single-feature split by entropy -----
+target_col <- "y_passXtremeDurability"
+if (!target_col %in% names(train)) stop("Target column not found in train file.")
+
+entropy <- function(y) {
+  ptab <- table(y) / length(y)
+  ptab <- ptab[ptab > 0]
+  -sum(ptab * log(ptab))
+}
+
+scan_cols <- setdiff(names(train), c(target_col, "ID", "Id", "id"))
+scan_cols_num <- scan_cols[sapply(train[scan_cols], function(x) is.numeric(x) || is.integer(x))]
+
+feature_scan <- list()
+for (col in scan_cols_num) {
+  x <- train[[col]]
+  y <- train[[target_col]]
+  cand <- unique(quantile(x, probs = seq(0.05, 0.95, by = 0.05), na.rm = TRUE))
+  best_score <- Inf; best_cut <- NA
+  for (c in cand) {
+    left_y  <- y[x <= c]
+    right_y <- y[x >  c]
+    if (length(left_y) == 0 || length(right_y) == 0) next
+    w_left  <- length(left_y) / length(y)
+    w_right <- 1 - w_left
+    score <- w_left * entropy(left_y) + w_right * entropy(right_y)
+    if (score < best_score) { best_score <- score; best_cut <- c }
+  }
+  feature_scan[[col]] <- list(best_cut = best_cut, entropy = best_score)
+}
+
+scan_df <- data.frame(feature = names(feature_scan),
+                      best_cut = sapply(feature_scan, `[[`, "best_cut"),
+                      entropy = sapply(feature_scan, `[[`, "entropy"),
+                      stringsAsFactors = FALSE)
+scan_df <- scan_df[order(scan_df$entropy), ]
+cat("Top features by single-feature split entropy:\n")
+print(head(scan_df, 15))
+
+# ---------- 3) Preprocessing: consistent factor levels (train+test) -------
+train_rows <- nrow(train)
+combined <- rbindlist(list(train[, setdiff(names(train), target_col)], test), use.names = TRUE, fill = TRUE)
+for (nm in names(combined)) {
+  if (is.character(combined[[nm]])) combined[[nm]] <- factor(combined[[nm]])
+}
+train_x <- combined[1:train_rows, ]
+test_x  <- combined[(train_rows+1):nrow(combined), ]
+
+# ---------- 4) Build model.matrix design matrices (one-hot) --------------
+pred_cols <- setdiff(names(train_x), c("ID","Id","id"))
+fm <- as.formula(paste("~ -1 +", paste(pred_cols, collapse = "+")))
+MM_train <- sparse.model.matrix(fm, data = train_x)
+MM_test  <- sparse.model.matrix(fm, data = test_x)
+
+# ---------- 5) Labels and stratified split for local validation -----------
+labels <- ifelse(train[[target_col]] == 1, 1L, 0L)
+set.seed(42)
+idx <- createDataPartition(labels, p = 0.8, list = FALSE)
+dtrain_idx <- idx
+dvalid_idx <- setdiff(seq_len(length(labels)), idx)
+dtrain <- xgb.DMatrix(data = MM_train[dtrain_idx, ], label = labels[dtrain_idx])
+dvalid <- xgb.DMatrix(data = MM_train[dvalid_idx, ], label = labels[dvalid_idx])
+dtest  <- xgb.DMatrix(data = MM_test)
+
+# ---------- 6) xgboost CV to find best nrounds (optimize logloss) -------
+params <- list(
+  objective = "binary:logistic",
+  eval_metric = "logloss",
+  booster = "gbtree",
+  eta = 0.02,             # smaller learning rate for more stable learning
+  max_depth = 4,          # shallower trees to reduce overfitting
+  subsample = 0.7,        # sample fraction of rows
+  colsample_bytree = 0.6, # sample fraction of columns
+  min_child_weight = 3,   # minimum sum of instance weight in a leaf
+  lambda = 3,             # L2 regularization
+  alpha = 0,              # L1 regularization
+  tree_method = "hist"    # faster histogram-based method
+)
+
+set.seed(42)
+cv <- xgb.cv(
+  params = params,
+  data = MM_train,
+  label = labels,
+  nfold = 5,
+  nrounds = 5000,               # more rounds since eta is smaller
+  verbose = 1,
+  early_stopping_rounds = 50,
+  maximize = FALSE,
+  showsd = TRUE,
+  stratified = TRUE,
+  prediction = FALSE
+)
+
+best_nrounds <- cv$best_iteration
+cat("Best nrounds from cv:", best_nrounds, "\n")
+
+# ---------- 7) Train final model on full training set ---------------------
+dtrain_full <- xgb.DMatrix(data = MM_train, label = labels)
+final_model <- xgb.train(
+  params = params,
+  data = dtrain_full,
+  nrounds = best_nrounds,
+  watchlist = list(train = dtrain_full),
+  verbose = 0
+)
+
+# ---------- 8) Evaluate on holdout (optional) -----------------------------
+pred_valid <- predict(final_model, MM_train[dvalid_idx, ])
+logloss <- function(y_true, p) {
+  eps <- 1e-15
+  p <- pmin(pmax(p, eps), 1 - eps)
+  -mean(y_true * log(p) + (1 - y_true) * log(1 - p))
+}
+vloss <- logloss(labels[dvalid_idx], pred_valid)
+cat("Holdout LogLoss (xgboost):", round(vloss, 6), "\n")
+cat("Holdout AUC (xgboost):", round(as.numeric(auc(labels[dvalid_idx], pred_valid)), 6), "\n")
+
+# ---------- 9) Predict on final_test and write submission ------------------
+pred_test <- predict(final_model, dtest)
+eps <- 1e-15
+pred_test <- pmin(pmax(pred_test, eps), 1 - eps)
+submission <- data.frame(ID = test_ids, y_passXtremeDurability = pred_test, stringsAsFactors = FALSE)
+names(submission)[1] <- id_col
+readr::write_csv(submission, "xgb_submission_logloss.csv")
+cat("Wrote xgb_submission_logloss.csv with", nrow(submission), "rows\n")
